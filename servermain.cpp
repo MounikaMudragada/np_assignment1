@@ -13,233 +13,254 @@
 #include <math.h>
 #include "calcLib.h"
 
-// Define constants for client queue size, timeout, protocol message, buffer size, and retry attempts
-#define CLIENT_QUEUE_LIMIT 5
-#define RESPONSE_TIMEOUT_SECONDS 5
-#define INITIAL_PROTOCOL_MESSAGE "TEXT TCP 1.0\n\n"
-#define BUFFER_MAX_SIZE 1024
-#define SOCKET_CREATION_ATTEMPTS 3           // Maximum buffer size for receiving or sending messages
-#define SOCKET_CREATION_ATTEMPTS 3          // Number of retry attempts for socket creation and binding
+#define MAX_QUEUE 5              // Maximum client connections in the queue
+#define RESPONSE_TIMEOUT 5       // Timeout (seconds) for client responses
+#define PROTOCOL_MESSAGE "TEXT TCP 1.0\n\n" // Protocol initialization message
+#define BUFFER_SIZE 1024         // Size for buffer
+#define FLOAT_PRECISION 0.0001   // Tolerance for floating-point comparison
+
+/**
+ * Get the readable IP address from a sockaddr structure (IPv4 or IPv6).
+ */
+void *extract_ip_address(struct sockaddr *addr) {
+    if (addr->sa_family == AF_INET) { // IPv4
+        return &(((struct sockaddr_in*)addr)->sin_addr);
+    } else { // IPv6
+        return &(((struct sockaddr_in6*)addr)->sin6_addr);
+    }
+}
+
+/**
+ * Verify the correctness of a floating-point result sent by the client.
+ *
+ * @param operation: The operation type (e.g., "fadd", "fsub").
+ * @param operand1: First operand (floating-point).
+ * @param operand2: Second operand (floating-point).
+ * @param client_result: The result received from the client.
+ * @return: 1 if the result is correct, 0 otherwise.
+ */
+int check_float_result(const char* operation, double operand1, double operand2, double client_result) {
+    double expected_result = 0.0;
+
+    if (strcmp(operation, "fadd") == 0) {
+        expected_result = operand1 + operand2;
+    } else if (strcmp(operation, "fsub") == 0) {
+        expected_result = operand1 - operand2;
+    } else if (strcmp(operation, "fmul") == 0) {
+        expected_result = operand1 * operand2;
+    } else if (strcmp(operation, "fdiv") == 0) {
+        expected_result = operand1 / operand2;
+    }
+
+    return fabs(expected_result - client_result) < FLOAT_PRECISION; // Compare within tolerance
+}
+
+/**
+ * Verify the correctness of an integer result sent by the client.
+ *
+ * @param operation: The operation type (e.g., "add", "sub").
+ * @param operand1: First operand (integer).
+ * @param operand2: Second operand (integer).
+ * @param client_result: The result received from the client.
+ * @return: 1 if the result is correct, 0 otherwise.
+ */
+int check_integer_result(const char* operation, int operand1, int operand2, int client_result) {
+    int expected_result = 0;
+
+    if (strcmp(operation, "add") == 0) {
+        expected_result = operand1 + operand2;
+    } else if (strcmp(operation, "sub") == 0) {
+        expected_result = operand1 - operand2;
+    } else if (strcmp(operation, "mul") == 0) {
+        expected_result = operand1 * operand2;
+    } else if (strcmp(operation, "div") == 0) {
+        expected_result = operand1 / operand2;
+    }
+
+    return expected_result == client_result;
+}
 
 int main(int argc, char *argv[]) {
-    // Validate command-line arguments to ensure the hostname and port are provided
     if (argc != 2) {
-        fprintf(stderr, "usage: %s hostname:port\n", argv[0]);
-        exit(1);
+        fprintf(stderr, "Usage: %s <IP:PORT>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    // Initialize the calculation library, used for generating random operations and operands
-    initCalcLib();
+    initCalcLib(); // Initialize calculation library for random operations
 
-    // Parse hostname and port from the input argument
-    char *inputHostname = strtok(argv[1], ":");
-    char *inputPort = strtok(NULL, ":");
-
-    // Declare variables for server socket, address structures, and socket options
-    int serverSocketDescriptor;
-    struct addrinfo addressHints, *serverInfo, *addressPointer;
-    struct sockaddr_storage clientSocketAddress;
-    socklen_t clientAddressSize;
-    char clientIPAddress[INET6_ADDRSTRLEN];
-    int socketOptionReuse = 1;
-
-    // Variables for socket read set and timeout configurations
-    fd_set socketReadSet;
-    struct timeval socketTimeout;
-
-    // Set up address hints for the server
-    memset(&addressHints, 0, sizeof addressHints);
-    addressHints.ai_family = AF_UNSPEC;      // Allow IPv4 or IPv6
-    addressHints.ai_socktype = SOCK_STREAM; // Use TCP
-    addressHints.ai_flags = AI_PASSIVE;     // Use the server's IP automatically
-
-    // Retrieve address information for the specified hostname and port
-    if (getaddrinfo(inputHostname, inputPort, &addressHints, &serverInfo) != 0) {
-        perror("getaddrinfo");
-        return 1;
+    // Parse server IP and port
+    char *server_ip = strtok(argv[1], ":");
+    char *server_port = strtok(NULL, ":");
+    if (server_ip == NULL || server_port == NULL) {
+        fprintf(stderr, "Error: Invalid format. Use IP:PORT.\n");
+        exit(EXIT_FAILURE);
     }
 
-    // Initialize retry logic for socket creation and binding
-    int creationAttempts = 0;
-    int socketCreated = 0;
+    // Server socket setup
+    int server_socket;
+    struct addrinfo hints, *server_info, *addr;
+    struct sockaddr_storage client_addr;
+    socklen_t client_addr_len;
+    char client_ip_str[INET6_ADDRSTRLEN];
+    int opt_reuse = 1;
 
-    // Retry creating and binding a socket up to SOCKET_CREATION_ATTEMPTS
-    for (creationAttempts = 0; creationAttempts < SOCKET_CREATION_ATTEMPTS; creationAttempts++) {
-        for (addressPointer = serverInfo; addressPointer != NULL; addressPointer = addressPointer->ai_next) {
-            // Create a socket
-            serverSocketDescriptor = socket(addressPointer->ai_family, addressPointer->ai_socktype, addressPointer->ai_protocol);
-            if (serverSocketDescriptor == -1) {
-                perror("server: socket");
-                continue;
-            }
+    fd_set active_fds; // File descriptor set for monitoring client activity
+    struct timeval timeout; // Timeout structure
 
-            // Configure the socket to reuse the address
-            if (setsockopt(serverSocketDescriptor, SOL_SOCKET, SO_REUSEADDR, &socketOptionReuse, sizeof(int)) == -1) {
-                perror("setsockopt");
-                close(serverSocketDescriptor);
-                continue;
-            }
+    // Address setup
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;     // Support both IPv4 and IPv6
+    hints.ai_socktype = SOCK_STREAM; // TCP socket
+    hints.ai_flags = AI_PASSIVE;     // Automatically bind to the host IP
 
-            // Bind the socket to the specified address and port
-            if (bind(serverSocketDescriptor, addressPointer->ai_addr, addressPointer->ai_addrlen) == -1) {
-                perror("server: bind");
-                close(serverSocketDescriptor);
-                continue;
-            }
+    // Resolve address and port
+    if (getaddrinfo(server_ip, server_port, &hints, &server_info) != 0) {
+        perror("Address resolution failed");
+        exit(EXIT_FAILURE);
+    }
 
-            // If the socket is successfully created and bound, set the flag and exit the loop
-            socketCreated = 1;
-            break;
+    // Create and bind the server socket
+    for (addr = server_info; addr != NULL; addr = addr->ai_next) {
+        server_socket = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (server_socket == -1) {
+            perror("Socket creation failed");
+            continue;
         }
 
-        // If the socket was created successfully, break out of the retry loop
-        if (socketCreated) break;
+        // Allow reuse of the address
+        if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt_reuse, sizeof(int)) == -1) {
+            perror("Setting socket options failed");
+            close(server_socket);
+            exit(EXIT_FAILURE);
+        }
 
-        fprintf(stderr, "Retrying socket creation attempt %d...\n", creationAttempts + 1);
-        sleep(1); // Wait before retrying
+        if (bind(server_socket, addr->ai_addr, addr->ai_addrlen) == -1) {
+            perror("Socket binding failed");
+            close(server_socket);
+            continue;
+        }
+
+        break; // Successfully bound
     }
 
-    // Free the address information after usage
-    freeaddrinfo(serverInfo);
+    freeaddrinfo(server_info); // Clean up address information
 
-    // If no socket could be created after all attempts, exit with an error
-    if (!socketCreated) {
-        fprintf(stderr, "server: failed to create and bind socket after %d attempts\n", SOCKET_CREATION_ATTEMPTS);
-        exit(1);
+    if (addr == NULL) {
+        fprintf(stderr, "Failed to bind to any address\n");
+        exit(EXIT_FAILURE);
     }
 
-    // Start listening for incoming client connections
-    if (listen(serverSocketDescriptor, CLIENT_QUEUE_LIMIT) == -1) {
-        perror("listen");
-        exit(1);
+    // Start listening for incoming connections
+    if (listen(server_socket, MAX_QUEUE) == -1) {
+        perror("Listening failed");
+        exit(EXIT_FAILURE);
     }
 
-    printf("Server is waiting for connections...\n");
+    printf("Server running on %s:%s\n", server_ip, server_port);
 
-    // Server loop to handle incoming connections
     while (1) {
-        clientAddressSize = sizeof clientSocketAddress;
-
-        // Accept a new client connection
-        int clientSocketDescriptor = accept(serverSocketDescriptor, (struct sockaddr *)&clientSocketAddress, &clientAddressSize);
-        if (clientSocketDescriptor == -1) {
-            perror("accept");
+        client_addr_len = sizeof(client_addr);
+        int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_addr_len);
+        if (client_socket == -1) {
+            perror("Failed to accept connection");
             continue;
         }
 
-        // Extract and display the client's IP address
-        if (clientSocketAddress.ss_family == AF_INET) {
-            inet_ntop(AF_INET, &(((struct sockaddr_in*)&clientSocketAddress)->sin_addr), clientIPAddress, sizeof clientIPAddress);
+        // Convert client IP to readable string
+        inet_ntop(client_addr.ss_family, extract_ip_address((struct sockaddr*)&client_addr), client_ip_str, sizeof(client_ip_str));
+        printf("Connected to client: %s\n", client_ip_str);
+
+        // Send protocol message
+        if (send(client_socket, PROTOCOL_MESSAGE, strlen(PROTOCOL_MESSAGE), 0) == -1) {
+            perror("Failed to send protocol message");
+            close(client_socket);
+            continue;
+        }
+
+        // Prepare for client response
+        FD_ZERO(&active_fds);
+        FD_SET(client_socket, &active_fds);
+        timeout.tv_sec = RESPONSE_TIMEOUT;
+        timeout.tv_usec = 0;
+
+        // Wait for acknowledgment ("OK\n")
+        int activity = select(client_socket + 1, &active_fds, NULL, NULL, &timeout);
+        if (activity <= 0) {
+            printf("Client response timed out.\n");
+            send(client_socket, "ERROR TO\n", 9, 0);
+            close(client_socket);
+            continue;
+        }
+
+        char buffer[BUFFER_SIZE];
+        memset(buffer, 0, sizeof(buffer));
+        int bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_received <= 0 || strcmp(buffer, "OK\n") != 0) {
+            printf("Invalid client response: %s\n", buffer);
+            close(client_socket);
+            continue;
+        }
+
+        // Generate random operation
+        char* operation = randomType();
+        double op1_f, op2_f, result_f_client;
+        int op1_i, op2_i, result_i_client;
+
+        memset(buffer, 0, sizeof(buffer));
+        if (operation[0] == 'f') {
+            op1_f = randomFloat();
+            op2_f = randomFloat();
+            sprintf(buffer, "%s %8.8g %8.8g\n", operation, op1_f, op2_f);
         } else {
-            inet_ntop(AF_INET6, &(((struct sockaddr_in6*)&clientSocketAddress)->sin6_addr), clientIPAddress, sizeof clientIPAddress);
+            op1_i = randomInt();
+            op2_i = randomInt();
+            sprintf(buffer, "%s %d %d\n", operation, op1_i, op2_i);
         }
 
-        printf("Connected to client at %s\n", clientIPAddress);
+        // Send task to client
+        send(client_socket, buffer, strlen(buffer), 0);
+        printf("Task sent to client: %s", buffer);
 
-        // Send the initial protocol message to the client
-        send(clientSocketDescriptor, INITIAL_PROTOCOL_MESSAGE, strlen(INITIAL_PROTOCOL_MESSAGE), 0);
-
-        // Initialize the read set for select() to monitor the client socket
-        FD_ZERO(&socketReadSet);
-        FD_SET(clientSocketDescriptor, &socketReadSet);
-        socketTimeout.tv_sec = RESPONSE_TIMEOUT_SECONDS;
-        socketTimeout.tv_usec = 0;
-
-        // Wait for the client's "OK\n" message with a timeout
-        int clientActivity = select(clientSocketDescriptor + 1, &socketReadSet, NULL, NULL, &socketTimeout);
-        if (clientActivity <= 0) {
-            printf("Client timeout or error.\n");
-            send(clientSocketDescriptor, "ERROR TO\n", 9, 0);
-            close(clientSocketDescriptor);
+        // Receive and validate client result
+        memset(buffer, 0, sizeof(buffer));
+        activity = select(client_socket + 1, &active_fds, NULL, NULL, &timeout);
+        if (activity <= 0) {
+            printf("Timeout waiting for client result.\n");
+            send(client_socket, "ERROR TO\n", 9, 0);
+            close(client_socket);
             continue;
         }
 
-        // Receive the "OK\n" message from the client
-        char messageBuffer[BUFFER_MAX_SIZE];
-        memset(messageBuffer, 0, sizeof(messageBuffer));
-        int receivedBytes = recv(clientSocketDescriptor, messageBuffer, BUFFER_MAX_SIZE - 1, 0);
-        if (receivedBytes < 0 || strcmp(messageBuffer, "OK\n") != 0) {
-            printf("Invalid client response: %s\n", messageBuffer);
-            close(clientSocketDescriptor);
+        bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes_received <= 0) {
+            printf("Client disconnected unexpectedly.\n");
+            close(client_socket);
             continue;
         }
 
-        // Generate a random operation and operands
-        char* randomOperation = randomType();
-        double floatOperand1, floatOperand2, floatClientResult;
-        int intOperand1, intOperand2, intClientResult;
-        memset(messageBuffer, 0, sizeof(messageBuffer));
-
-        if (randomOperation[0] == 'f') {
-            floatOperand1 = randomFloat();
-            floatOperand2 = randomFloat();
-            sprintf(messageBuffer, "%s %8.8g %8.8g\n", randomOperation, floatOperand1, floatOperand2);
-        } else {
-            intOperand1 = randomInt();
-            intOperand2 = randomInt();
-            sprintf(messageBuffer, "%s %d %d\n", randomOperation, intOperand1, intOperand2);
-        }
-
-        // Send the operation and operands to the client
-        send(clientSocketDescriptor, messageBuffer, strlen(messageBuffer), 0);
-        printf("Sent to client: %s", messageBuffer);
-
-        // Wait for the client's result response with a timeout
-        memset(messageBuffer, 0, sizeof(messageBuffer));
-        clientActivity = select(clientSocketDescriptor + 1, &socketReadSet, NULL, NULL, &socketTimeout);
-        if (clientActivity <= 0) {
-            printf("Client timeout or error receiving result.\n");
-            send(clientSocketDescriptor, "ERROR TO\n", 9, 0);
-            close(clientSocketDescriptor);
-            continue;
-        }
-
-        // Receive the client's result
-        receivedBytes = recv(clientSocketDescriptor, messageBuffer, BUFFER_MAX_SIZE - 1, 0);
-        if (receivedBytes <= 0) {
-            printf("Client disconnected or error.\n");
-            close(clientSocketDescriptor);
-            continue;
-        }
-
-        // Validate the client's result based on the operation type
-        if (randomOperation[0] == 'f') {
-            sscanf(messageBuffer, "%lf", &floatClientResult);
-            double computedFloatResult;
-            if (strcmp(randomOperation, "fadd") == 0) computedFloatResult = floatOperand1 + floatOperand2;
-            else if (strcmp(randomOperation, "fsub") == 0) computedFloatResult = floatOperand1 - floatOperand2;
-            else if (strcmp(randomOperation, "fmul") == 0) computedFloatResult = floatOperand1 * floatOperand2;
-            else if (strcmp(randomOperation, "fdiv") == 0) computedFloatResult = floatOperand1 / floatOperand2;
-
-            if (fabs(computedFloatResult - floatClientResult) < 0.0001) {
-                send(clientSocketDescriptor, "OK\n", 3, 0);
-                printf("Correct result from client.\n");
+        if (operation[0] == 'f') {
+            sscanf(buffer, "%lf", &result_f_client);
+            if (check_float_result(operation, op1_f, op2_f, result_f_client)) {
+                send(client_socket, "OK\n", 3, 0);
+                printf("Correct floating-point result.\n");
             } else {
-                send(clientSocketDescriptor, "ERROR\n", 6, 0);
-                printf("Incorrect result from client.\n");
+                send(client_socket, "ERROR\n", 6, 0);
+                printf("Incorrect floating-point result.\n");
             }
         } else {
-            sscanf(messageBuffer, "%d", &intClientResult);
-            int computedIntResult;
-            if (strcmp(randomOperation, "add") == 0) computedIntResult = intOperand1 + intOperand2;
-            else if (strcmp(randomOperation, "sub") == 0) computedIntResult = intOperand1 - intOperand2;
-            else if (strcmp(randomOperation, "mul") == 0) computedIntResult = intOperand1 * intOperand2;
-            else if (strcmp(randomOperation, "div") == 0) computedIntResult = intOperand1 / intOperand2;
-
-            if (computedIntResult == intClientResult) {
-                send(clientSocketDescriptor, "OK\n", 3, 0);
-                printf("Correct result from client.\n");
+            sscanf(buffer, "%d", &result_i_client);
+            if (check_integer_result(operation, op1_i, op2_i, result_i_client)) {
+                send(client_socket, "OK\n", 3, 0);
+                printf("Correct integer result.\n");
             } else {
-                send(clientSocketDescriptor, "ERROR\n", 6, 0);
-                printf("Incorrect result from client.\n");
+                send(client_socket, "ERROR\n", 6, 0);
+                printf("Incorrect integer result.\n");
             }
         }
 
-        // Close the client connection after processing
-        close(clientSocketDescriptor);
+        close(client_socket); // Close client connection
     }
 
-    // Close the server socket when exiting
-    close(serverSocketDescriptor);
+    close(server_socket); // Close server socket
     return 0;
 }
