@@ -142,11 +142,15 @@ int main(int argc, char *argv[]) {
         }
 
         char clientIP[INET6_ADDRSTRLEN];
-        inet_ntop(clientAddr.ss_family,
-                  clientAddr.ss_family == AF_INET
-                      ? (void *)&(((struct sockaddr_in *)&clientAddr)->sin_addr)
-                      : (void *)&(((struct sockaddr_in6 *)&clientAddr)->sin6_addr),
-                  clientIP, sizeof(clientIP));
+        void *addrPtr;
+
+if (clientAddr.ss_family == AF_INET) {
+    addrPtr = (void *)&(((struct sockaddr_in *)&clientAddr)->sin_addr);
+} else {
+    addrPtr = (void *)&(((struct sockaddr_in6 *)&clientAddr)->sin6_addr);
+}
+
+inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
         int clientPort = ntohs(((struct sockaddr_in *)&clientAddr)->sin_port);
 
         printf("Message received from %s:%d\n", clientIP, clientPort);
