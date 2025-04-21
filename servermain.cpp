@@ -17,7 +17,6 @@
 #include <ctime>
 #include <sys/select.h>
 #include <calcLib.h>
-#include "protocol.h"
 
 using namespace std;
 
@@ -27,6 +26,39 @@ using namespace std;
 #define PROTOCOL_VERSION_MAJOR 1
 #define PROTOCOL_VERSION_MINOR 0
 #define TIMEOUT_SEC 10
+
+// ---------- protocol.h content begins here ----------
+#ifndef PROTOCOL_H
+#define PROTOCOL_H
+
+#include <stdint.h>
+
+// Handshake message from client
+struct calcMessage {
+    uint16_t type;
+    uint32_t message;
+    uint32_t protocol;
+    uint16_t major_version;
+    uint16_t minor_version;
+};
+
+// Task assignment or response
+struct calcProtocol {
+    uint32_t type;
+    uint32_t major_version;
+    uint32_t minor_version;
+    uint32_t id;
+    uint32_t arith;
+    int32_t inValue1;
+    int32_t inValue2;
+    float flValue1;
+    float flValue2;
+    float inResult;
+    float flResult;
+};
+
+#endif
+// ---------- protocol.h content ends here ----------
 
 struct ClientData {
     int id;
@@ -41,10 +73,9 @@ struct ClientData {
         : id(clientID), ipAddress(ip), portNumber(port), lastActivity(time(nullptr)), assignment(task) {}
 };
 
-map<int, ClientData> activeClients; // Track active clients
+map<int, ClientData> activeClients;
 int nextClientID = 1;
 
-// Define response messages
 const calcMessage RESPONSE_NOT_OK = {htons(2), htonl(2), htonl(17), htons(PROTOCOL_VERSION_MAJOR), htons(PROTOCOL_VERSION_MINOR)};
 const calcMessage RESPONSE_OK = {htons(2), htonl(1), htonl(17), htons(PROTOCOL_VERSION_MAJOR), htons(PROTOCOL_VERSION_MINOR)};
 
@@ -98,8 +129,8 @@ int main(int argc, char *argv[]) {
     socklen_t addrLen = sizeof(clientAddr);
     char buffer[MAXBUFLEN];
 
-    hints.ai_family = AF_UNSPEC; // Support both IPv4 and IPv6
-    hints.ai_socktype = SOCK_DGRAM; // UDP
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;
 
     if (getaddrinfo(hostName, portString, &hints, &serverInfo) != 0) {
@@ -143,16 +174,17 @@ int main(int argc, char *argv[]) {
 
         char clientIP[INET6_ADDRSTRLEN];
         void *addrPtr;
+        int clientPort;
 
-if (clientAddr.ss_family == AF_INET) {
-    addrPtr = (void *)&(((struct sockaddr_in *)&clientAddr)->sin_addr);
-} else {
-    addrPtr = (void *)&(((struct sockaddr_in6 *)&clientAddr)->sin6_addr);
-}
+        if (clientAddr.ss_family == AF_INET) {
+            addrPtr = (void *)&(((struct sockaddr_in *)&clientAddr)->sin_addr);
+            clientPort = ntohs(((struct sockaddr_in *)&clientAddr)->sin_port);
+        } else {
+            addrPtr = (void *)&(((struct sockaddr_in6 *)&clientAddr)->sin6_addr);
+            clientPort = ntohs(((struct sockaddr_in6 *)&clientAddr)->sin6_port);
+        }
 
-inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
-        int clientPort = ntohs(((struct sockaddr_in *)&clientAddr)->sin_port);
-
+        inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
         printf("Message received from %s:%d\n", clientIP, clientPort);
 
         if (receivedBytes == sizeof(calcMessage)) {
@@ -161,7 +193,7 @@ inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
 
             clientMsg.type = ntohs(clientMsg.type);
             clientMsg.message = ntohl(clientMsg.message);
-            clientMsg.protocol = ntohs(clientMsg.protocol);
+            clientMsg.protocol = ntohl(clientMsg.protocol);
             clientMsg.major_version = ntohs(clientMsg.major_version);
             clientMsg.minor_version = ntohs(clientMsg.minor_version);
 
@@ -197,6 +229,7 @@ inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
                 printf("Sent calculation task to client %d\n", nextClientID);
                 nextClientID++;
             }
+
         } else if (receivedBytes == sizeof(calcProtocol)) {
             struct calcProtocol clientResponse;
             memcpy(&clientResponse, buffer, sizeof(clientResponse));
@@ -225,3 +258,4 @@ inet_ntop(clientAddr.ss_family, addrPtr, clientIP, sizeof(clientIP));
     close(serverSocket);
     return 0;
 }
+
